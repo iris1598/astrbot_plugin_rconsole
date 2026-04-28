@@ -310,6 +310,7 @@ async def process_bilibili_url(event: AstrMessageEvent, credential: Credential, 
             Comp.Plain(
                 f"\n识别：B站，{video_title}\n{extra_bili_info(video_info)}\n简介：{video_desc}\n{online_str}\n---------\n⚠️ 当前视频时长 {video_duration // 60} 分钟，超过管理员设置的最长时间 {video_duration_maximum // 60} 分钟！")
         ])
+        return  # 超出时长限制，不执行下载
     # 获取下载链接
     download_url_data = await v.get_download_url(page_index=page_num)
     detecter = VideoDownloadURLDataDetecter(download_url_data)

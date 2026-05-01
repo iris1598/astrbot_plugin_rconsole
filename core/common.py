@@ -1,6 +1,6 @@
 import re
 import os
-from typing import List, Dict, Any, Union, Sequence, Optional
+from typing import List, Dict, Any, Union, Sequence, Optional, AsyncGenerator
 
 import astrbot.api.message_components as Comp
 from astrbot.api.event import AstrMessageEvent
@@ -81,26 +81,26 @@ def create_forward_message(content_list: List[Union[List[Any], Dict[str, Any]]],
     
     return nodes
 
-async def send_forward_message(event: AstrMessageEvent, 
+async def send_forward_message(event: AstrMessageEvent,
                              content_list: List[Union[List[Any], Dict[str, Any]]],
-                             default_name: Optional[str] = None, 
+                             default_name: Optional[str] = None,
                              default_uin: Optional[Union[int, str]] = None) -> Any:
     """
     发送合并转发消息
-    
+
     :param event: AstrMessageEvent实例
     :param content_list: 消息内容列表
     :param default_name: 默认显示的发送者名称，如果为None将使用发送者的名称
     :param default_uin: 默认显示的发送者ID，如果为None将使用发送者的ID
     :return: 消息发送结果
-    
+
     使用示例:
     >>> # 使用发送者信息
     >>> yield await send_forward_message(event, [
     >>>     [Comp.Plain("第一条消息")],
     >>>     [Comp.Image.fromURL("http://example.com/image.jpg")]
     >>> ])
-    >>> 
+    >>>
     >>> # 自定义名称
     >>> yield await send_forward_message(event, [
     >>>     [Comp.Plain("第一条消息")],
@@ -112,6 +112,27 @@ async def send_forward_message(event: AstrMessageEvent,
         default_name = event.get_sender_name()
     if default_uin is None:
         default_uin = event.get_sender_id()
-        
+
     nodes = create_forward_message(content_list, default_name, default_uin)
     return event.chain_result([nodes])
+
+
+async def send_images_sequentially(event: AstrMessageEvent,
+                                   content_list: List[Union[List[Any], Dict[str, Any]]],
+                                   generator: Any) -> AsyncGenerator:
+    """
+    逐条发送图片消息（不使用合并转发）
+
+    :param event: AstrMessageEvent实例
+    :param content_list: 消息内容列表
+    :param generator: 用于 yield 的异步生成器引用（传 None 即可，此函数本身是生成器）
+    :return: 异步生成器，逐条 yield 消息
+
+    当合并转发消息开关关闭时，使用此方法逐条发送图片，
+    每条消息只包含一张图片及其对应的文字说明。
+    """
+    for item in content_list:
+        if isinstance(item, list):
+            yield event.chain_result(item)
+        elif isinstance(item, dict) and 'content' in item:
+            yield event.chain_result(item['content'])

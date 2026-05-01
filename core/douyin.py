@@ -1,4 +1,5 @@
 import os
+import json
 import random
 import re
 import time
@@ -12,7 +13,7 @@ from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent
 
 from ..constants.douyin import DOUYIN_HEADER, DOUYIN_VIDEO_API, DOUYIN_TOUTIAO_API, URL_TYPE_CODE_DICT
-from .common import create_forward_message, send_forward_message
+from .common import create_forward_message, send_forward_message, send_images_sequentially
 
 # 尝试导入execjs，但即使导入失败也不影响基本功能
 try:
@@ -84,6 +85,91 @@ def generate_x_bogus_url(url, headers):
     except Exception as e:
         logger.error(f"生成A-Bogus签名失败: {e}")
         return url
+
+
+async def fetch_douyin_cover_from_page(item_id: str, is_note: bool = False) -> Optional[str]:
+    """
+    通过访问 iesdouyin.com 页面获取抖音封面（参照 media_parser 的方式，不依赖 Cookie）
+    :param item_id: 视频/笔记 ID
+    :param is_note: 是否为笔记类型
+    :return: 封面图片URL，失败则返回 None
+    """
+    if is_note:
+        page_url = f"https://www.iesdouyin.com/share/note/{item_id}/"
+    else:
+        page_url = f"https://www.iesdouyin.com/share/video/{item_id}/"
+
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Linux; Android 8.0.0; SM-G955U Build/R16NW) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/116.0.0.0 Mobile Safari/537.36"
+        ),
+        "Referer": "https://www.douyin.com/?is_from_mobile_home=1&recommend=1",
+        "Accept-Encoding": "gzip, deflate",
+    }
+
+    try:
+        async with httpx.AsyncClient(headers=headers, follow_redirects=True) as client:
+            resp = await client.get(page_url, timeout=10)
+            if resp.status_code >= 400:
+                return None
+            html = resp.text
+
+        # 提取 window._ROUTER_DATA JSON
+        start_flag = "window._ROUTER_DATA = "
+        start_idx = html.find(start_flag)
+        if start_idx == -1:
+            return None
+        brace_start = html.find("{", start_idx)
+        if brace_start == -1:
+            return None
+
+        index = brace_start
+        stack = []
+        json_str = None
+        while index < len(html):
+            if html[index] == "{":
+                stack.append("{")
+            elif html[index] == "}":
+                stack.pop()
+                if not stack:
+                    json_str = html[brace_start:index + 1]
+                    break
+            index += 1
+
+        if not json_str:
+            return None
+
+        json_str = json_str.replace("\\u002F", "/").replace("\\/", "/")
+        try:
+            json_data = json.loads(json_str)
+        except Exception:
+            return None
+
+        # 遍历 loaderData，找到 item_list
+        loader_data = json_data.get("loaderData", {})
+        item_info = None
+        for value in loader_data.values():
+            if isinstance(value, dict):
+                video_info = value.get("videoInfoRes") or value.get("noteDetailRes")
+                if video_info and video_info.get("item_list"):
+                    item_info = video_info["item_list"][0]
+                    break
+
+        if not item_info:
+            return None
+
+        # 取封面：优先 video.cover.url_list，其次 cover.url_list
+        cover_obj = item_info.get("video", {}).get("cover") or item_info.get("cover", {})
+        url_list = cover_obj.get("url_list", []) if isinstance(cover_obj, dict) else []
+        if url_list and url_list[0]:
+            return url_list[0]
+
+    except Exception as e:
+        logger.debug(f"fetch_douyin_cover_from_page 失败: {e}")
+
+    return None
 
 
 async def get_douyin_slide_info(url: str) -> Tuple[Optional[str], Optional[str], Optional[str], List[str]]:
@@ -222,7 +308,7 @@ async def download_image(url: str, session: Optional[aiohttp.ClientSession] = No
         return None
 
 
-async def process_douyin_url(event: AstrMessageEvent, douyin_ck: str = "") -> AsyncGenerator:
+async def process_douyin_url(event: AstrMessageEvent, douyin_ck: str = "", enable_forward: bool = True) -> AsyncGenerator:
     """
     处理抖音链接
     :param event: AstrBot消息事件
@@ -256,54 +342,57 @@ async def process_douyin_url(event: AstrMessageEvent, douyin_ck: str = "") -> As
         # 处理图集 (如NoneBot示例中的方式)
         if "share/slides" in dou_url_2:
             cover, author, title, images = await get_douyin_slide_info(douyin_url)
-            
-            if author is not None and cover is not None:
-                # 先发送封面和基本信息
-                yield event.chain_result([
-                    Comp.Image.fromURL(cover),
-                    Comp.Plain(f"\n识别：抖音\n作者：{author}\n标题：{title}")
-                ])
-                
-                # 使用转发消息发送图片集
-                if images:
-                    # 创建消息内容列表
-                    content_list = []
-                    
-                    # 添加介绍消息
-                    content_list.append([
-                        Comp.Plain(f"抖音 | {title}\n作者: {author}\n\n图集共 {len(images)} 张图片")
-                    ])
-                    
-                    # 下载图片
-                    downloaded_images = []
-                    try:
-                        async with aiohttp.ClientSession() as session:
-                            download_tasks = []
-                            for image_url in images:
-                                if image_url is not None:
-                                    download_tasks.append(download_image(image_url, session))
-                                    
-                            if download_tasks:
-                                downloaded_images = await asyncio.gather(*download_tasks)
-                    except Exception as e:
-                        logger.error(f"下载图片失败: {e}")
-                    
-                    # 添加每张图片到转发消息
-                    for i, image_path in enumerate(downloaded_images):
-                        if image_path is not None:
-                            content_list.append([
-                                Comp.Image.fromFileSystem(image_path),
-                                Comp.Plain(f"\n第 {i+1}/{len(downloaded_images)} 张")
-                            ])
-                    
-                    # 发送合并转发消息
-                    if content_list:
+
+            if author is not None and images:
+                # 尝试从页面获取封面（media_parser 方式）
+                slide_id_match = re.search(r"share\/slides\/(\d+)", dou_url_2)
+                if slide_id_match:
+                    page_cover = await fetch_douyin_cover_from_page(slide_id_match.group(1))
+                    if page_cover:
+                        cover = page_cover
+
+                # 创建消息内容列表
+                content_list = []
+
+                # 第一条：封面图 + 简介文字（只发一次，合并/逐条都用这一条）
+                intro_comps = []
+                if cover:
+                    intro_comps.append(Comp.Image.fromURL(cover))
+                intro_comps.append(Comp.Plain(f"识别：抖音\n作者：{author}\n标题：{title}\n图集共 {len(images)} 张图片"))
+                content_list.append(intro_comps)
+
+                # 下载图片
+                downloaded_images = []
+                try:
+                    async with aiohttp.ClientSession() as session:
+                        download_tasks = [
+                            download_image(image_url, session)
+                            for image_url in images
+                            if image_url is not None
+                        ]
+                        if download_tasks:
+                            downloaded_images = await asyncio.gather(*download_tasks)
+                except Exception as e:
+                    logger.error(f"下载图片失败: {e}")
+
+                # 添加每张图片到转发消息
+                for i, image_path in enumerate(downloaded_images):
+                    if image_path is not None:
+                        content_list.append([
+                            Comp.Image.fromFileSystem(image_path),
+                            Comp.Plain(f"\n第 {i+1}/{len(downloaded_images)} 张")
+                        ])
+
+                # 发送
+                if content_list:
+                    if enable_forward:
                         try:
                             yield await send_forward_message(event, content_list)
                         except Exception as e:
                             logger.error(f"发送合并转发消息失败: {e}")
-                            # 失败后单独发送每张图片
-                            yield event.plain_result(f"合并转发失败，单独发送图片...")
+                            yield event.plain_result("合并转发失败，单独发送图片...")
+                            for result in [event.chain_result(content_list[0])]:
+                                yield result
                             for i, image_path in enumerate(downloaded_images):
                                 if image_path is not None:
                                     try:
@@ -313,14 +402,17 @@ async def process_douyin_url(event: AstrMessageEvent, douyin_ck: str = "") -> As
                                         ])
                                     except Exception as e2:
                                         logger.error(f"发送单张图片失败: {e2}")
-                    
-                    # 清理临时文件
-                    for path in downloaded_images:
-                        if path and os.path.exists(path):
-                            try:
-                                os.remove(path)
-                            except Exception as e:
-                                logger.error(f"删除临时文件失败: {e}")
+                    else:
+                        async for result in send_images_sequentially(event, content_list, None):
+                            yield result
+
+                # 清理临时文件
+                for path in downloaded_images:
+                    if path and os.path.exists(path):
+                        try:
+                            os.remove(path)
+                        except Exception as e:
+                            logger.error(f"删除临时文件失败: {e}")
             else:
                 yield event.plain_result("抖音图集解析失败")
             return
@@ -382,7 +474,12 @@ async def process_douyin_url(event: AstrMessageEvent, douyin_ck: str = "") -> As
 
                 # 获取无水印视频地址
                 player_real_addr = DOUYIN_TOUTIAO_API.format(uri)
-                cover_url = video_info.get('cover', { }).get('url_list', [None])[0]
+
+                # 封面：优先从页面解析获取（media_parser 方式），回退到 API 返回的 cover
+                is_note = "/note/" in dou_url_2
+                cover_url = await fetch_douyin_cover_from_page(douyin_id, is_note=is_note)
+                if not cover_url:
+                    cover_url = video_info.get('cover', { }).get('url_list', [None])[0]
 
                 if cover_url is not None:
                     yield event.chain_result([
@@ -394,38 +491,44 @@ async def process_douyin_url(event: AstrMessageEvent, douyin_ck: str = "") -> As
                 yield event.chain_result([Comp.Video.fromURL(player_real_addr)])
 
             elif url_type == 'image':
-                # 发送基本信息
-                yield event.chain_result([
-                    Comp.Plain(f"识别：抖音\n作者：{author}\n标题：{desc}")
-                ])
-
                 # 处理图片集
                 images = detail.get('images', [])
-                
+
                 if not images:
                     yield event.plain_result("无法获取图片内容")
                     return
-                
+
+                # 封面：优先从页面解析获取（media_parser 方式），回退到第一张图片
+                is_note = "/note/" in dou_url_2
+                cover_url = await fetch_douyin_cover_from_page(douyin_id, is_note=is_note)
+
                 # 创建消息内容列表
                 content_list = []
-                
-                # 添加介绍消息
-                content_list.append([
-                    Comp.Plain(f"抖音 | {desc}\n作者: {author}\n\n图集共 {len(images)} 张图片")
-                ])
-                
+
+                # 第一条：封面（若有）+ 简介文字（只发一次，合并/逐条都用这一条）
+                intro_comps = []
+                if cover_url:
+                    intro_comps.append(Comp.Image.fromURL(cover_url))
+                intro_comps.append(Comp.Plain(f"识别：抖音\n作者：{author}\n标题：{desc}\n图集共 {len(images)} 张图片"))
+                content_list.append(intro_comps)
+
                 # 添加每张图片
                 for i, img in enumerate(images):
                     url_list = img.get('url_list', [])
-                    if url_list and url_list[1] is not None:
+                    img_url = url_list[1] if len(url_list) > 1 and url_list[1] else (url_list[0] if url_list else None)
+                    if img_url is not None:
                         content_list.append([
-                            Comp.Image.fromURL(url_list[1]),
+                            Comp.Image.fromURL(img_url),
                             Comp.Plain(f"\n第 {i+1}/{len(images)} 张")
                         ])
-                
+
                 # 发送合并转发消息
                 if content_list:
-                    yield await send_forward_message(event, content_list)
+                    if enable_forward:
+                        yield await send_forward_message(event, content_list)
+                    else:
+                        async for result in send_images_sequentially(event, content_list, None):
+                            yield result
 
     except Exception as e:
         logger.error(f"处理抖音链接失败: {e}")

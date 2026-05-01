@@ -23,5 +23,12 @@
     "type": "string",
     "hint": "通过小红书的Cookie获取",
     "obvious_hint": true
+  },
+  "ENABLE_FORWARD_MESSAGE": {
+    "description": "合并转发消息",
+    "type": "bool",
+    "default": true,
+    "hint": "开启后图集内容将以合并转发消息形式发送，关闭后逐条发送图片",
+    "obvious_hint": true
   }
 }

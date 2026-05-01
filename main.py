@@ -41,6 +41,7 @@ class RPlugin(Star):
         self.VIDEO_DURATION_MAXIMUM = self.config["VIDEO_DURATION_MAXIMUM"]
         self.DOUYIN_CK = self.config.get("DOUYIN_CK", "")
         self.XHS_CK = self.config.get("XHS_CK", "")
+        self.ENABLE_FORWARD_MESSAGE = self.config.get("ENABLE_FORWARD_MESSAGE", True)
 
     async def initialize(self):
         """可选择实现异步的插件初始化方法，当实例化该插件类之后会自动调用该方法。"""
@@ -156,14 +157,14 @@ class RPlugin(Star):
     async def douyin(self, event: AstrMessageEvent):
         if self._has_json_component(event):
             return
-        async for result in process_douyin_url(event, self.DOUYIN_CK):
+        async for result in process_douyin_url(event, self.DOUYIN_CK, self.ENABLE_FORWARD_MESSAGE):
             yield result
 
     @filter.regex(XHS_PATTERN)
     async def xiaohongshu(self, event: AstrMessageEvent):
         if self._has_json_component(event):
             return
-        async for result in process_xiaohongshu_url(event, self.XHS_CK):
+        async for result in process_xiaohongshu_url(event, self.XHS_CK, self.ENABLE_FORWARD_MESSAGE):
             yield result
 
     # ---------- 通用 JSON 卡片处理器 ----------
@@ -201,13 +202,13 @@ class RPlugin(Star):
             elif DOUYIN_PATTERN.match(link):
                 logger.info(f"📦 卡片抖音链接: {link}")
                 wrapped_event = _EventUrlWrapper(event, link)
-                async for result in process_douyin_url(wrapped_event, self.DOUYIN_CK):
+                async for result in process_douyin_url(wrapped_event, self.DOUYIN_CK, self.ENABLE_FORWARD_MESSAGE):
                     yield result
                 return
             elif XHS_PATTERN.match(link):
                 logger.info(f"📦 卡片小红书链接: {link}")
                 wrapped_event = _EventUrlWrapper(event, link)
-                async for result in process_xiaohongshu_url(wrapped_event, self.XHS_CK):
+                async for result in process_xiaohongshu_url(wrapped_event, self.XHS_CK, self.ENABLE_FORWARD_MESSAGE):
                     yield result
                 return
 

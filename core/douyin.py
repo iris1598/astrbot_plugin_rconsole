@@ -1,534 +1,342 @@
-import os
+"""
+抖音解析模块 - 无Cookie解析方式
+基于 iesdouyin.com 分享页面的 window._ROUTER_DATA 提取视频/图集信息
+"""
+import asyncio
 import json
+import os
 import random
 import re
 import time
-import asyncio
-from typing import List, Tuple, Optional, AsyncGenerator
+from typing import AsyncGenerator, Optional
 
-import astrbot.api.message_components as Comp
-import httpx
 import aiohttp
+import astrbot.api.message_components as Comp
 from astrbot.api import logger
 from astrbot.api.event import AstrMessageEvent
 
-from ..constants.douyin import DOUYIN_HEADER, DOUYIN_VIDEO_API, DOUYIN_TOUTIAO_API, URL_TYPE_CODE_DICT
-from .common import create_forward_message, send_forward_message, send_images_sequentially
+from .common import send_forward_message
 
-# 尝试导入execjs，但即使导入失败也不影响基本功能
-try:
-    import execjs
-    import urllib.parse
+# 移动端 Android Chrome UA —— 无需 Cookie 即可获取 SSR 数据
+DOUYIN_USER_AGENT = (
+    "Mozilla/5.0 (Linux; Android 8.0.0; SM-G955U Build/R16NW) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/116.0.0.0 Mobile Safari/537.36"
+)
 
-    HAS_EXECJS = True
-except ImportError:
-    logger.warning("execjs not installed, X-Bogus signature generation will be skipped")
-    HAS_EXECJS = False
-    import urllib.parse
+DOUYIN_HEADERS = {
+    "User-Agent": DOUYIN_USER_AGENT,
+    "Referer": "https://www.douyin.com/?is_from_mobile_home=1&recommend=1",
+    "Accept-Encoding": "gzip, deflate",
+}
 
-# 临时目录设置 - 使用标准化的路径格式
-DATA_DIR = os.path.join(os.getcwd(), "data")
+# 临时目录设置
+DATA_DIR = os.path.join(os.getcwd(), "data", "plugin_data", "astrbot_plugin_rconsole")
 CACHE_DIR = os.path.join(DATA_DIR, "douyin_cache")
 
-# 确保缓存目录存在
 try:
     os.makedirs(CACHE_DIR, exist_ok=True)
-    logger.info(f"确保抖音缓存目录存在: {CACHE_DIR}")
 except Exception as e:
     logger.error(f"创建缓存目录失败: {e}")
 
 
-def generate_random_str(randomlength=16):
-    """
-    根据传入长度产生随机字符串
-    param :randomlength
-    return:random_str
-    """
-    random_str = ''
-    base_str = 'ABCDEFGHIGKLMNOPQRSTUVWXYZabcdefghigklmnopqrstuvwxyz0123456789='
-    length = len(base_str) - 1
-    for _ in range(randomlength):
-        random_str += base_str[random.randint(0, length)]
-    return random_str
+# ── 核心：从 HTML 中提取 window._ROUTER_DATA ──
 
-
-def generate_x_bogus_url(url, headers):
-    """
-    生成抖音A-Bogus签名 (如果有execjs)
-    :param url: 视频链接
-    :param headers: 请求头
-    :return: 包含X-Bogus签名的URL
-    """
-    if not HAS_EXECJS:
-        # 如果没有execjs，返回原始URL
-        return url
-
-    try:
-        # 获取查询部分
-        query = urllib.parse.urlparse(url).query
-        # A-Bogus JS文件路径
-        abogus_file_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'core',
-                                        'a-bogus.js')
-
-        # 检查文件是否存在
-        if not os.path.exists(abogus_file_path):
-            logger.warning(f"A-Bogus JS file not found at {abogus_file_path}")
-            return url
-
-        # 读取JS文件并执行
-        with open(abogus_file_path, 'r', encoding='utf-8') as abogus_file:
-            abogus_js = abogus_file.read()
-
-        abogus = execjs.compile(abogus_js).call('generate_a_bogus', query, headers['User-Agent'])
-        logger.debug(f'生成的A-Bogus签名为: {abogus}')
-        return url + "&a_bogus=" + abogus
-    except Exception as e:
-        logger.error(f"生成A-Bogus签名失败: {e}")
-        return url
-
-
-async def fetch_douyin_cover_from_page(item_id: str, is_note: bool = False) -> Optional[str]:
-    """
-    通过访问 iesdouyin.com 页面获取抖音封面（参照 media_parser 的方式，不依赖 Cookie）
-    :param item_id: 视频/笔记 ID
-    :param is_note: 是否为笔记类型
-    :return: 封面图片URL，失败则返回 None
-    """
-    if is_note:
-        page_url = f"https://www.iesdouyin.com/share/note/{item_id}/"
-    else:
-        page_url = f"https://www.iesdouyin.com/share/video/{item_id}/"
-
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (Linux; Android 8.0.0; SM-G955U Build/R16NW) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/116.0.0.0 Mobile Safari/537.36"
-        ),
-        "Referer": "https://www.douyin.com/?is_from_mobile_home=1&recommend=1",
-        "Accept-Encoding": "gzip, deflate",
-    }
-
-    try:
-        async with httpx.AsyncClient(headers=headers, follow_redirects=True) as client:
-            resp = await client.get(page_url, timeout=10)
-            if resp.status_code >= 400:
-                return None
-            html = resp.text
-
-        # 提取 window._ROUTER_DATA JSON
-        start_flag = "window._ROUTER_DATA = "
-        start_idx = html.find(start_flag)
-        if start_idx == -1:
-            return None
-        brace_start = html.find("{", start_idx)
-        if brace_start == -1:
-            return None
-
-        index = brace_start
-        stack = []
-        json_str = None
-        while index < len(html):
-            if html[index] == "{":
-                stack.append("{")
-            elif html[index] == "}":
-                stack.pop()
-                if not stack:
-                    json_str = html[brace_start:index + 1]
-                    break
-            index += 1
-
-        if not json_str:
-            return None
-
-        json_str = json_str.replace("\\u002F", "/").replace("\\/", "/")
-        try:
-            json_data = json.loads(json_str)
-        except Exception:
-            return None
-
-        # 遍历 loaderData，找到 item_list
-        loader_data = json_data.get("loaderData", {})
-        item_info = None
-        for value in loader_data.values():
-            if isinstance(value, dict):
-                video_info = value.get("videoInfoRes") or value.get("noteDetailRes")
-                if video_info and video_info.get("item_list"):
-                    item_info = video_info["item_list"][0]
-                    break
-
-        if not item_info:
-            return None
-
-        # 取封面：优先 video.cover.url_list，其次 cover.url_list
-        cover_obj = item_info.get("video", {}).get("cover") or item_info.get("cover", {})
-        url_list = cover_obj.get("url_list", []) if isinstance(cover_obj, dict) else []
-        if url_list and url_list[0]:
-            return url_list[0]
-
-    except Exception as e:
-        logger.debug(f"fetch_douyin_cover_from_page 失败: {e}")
-
+def _extract_router_data(text: str) -> Optional[str]:
+    """从 HTML 中提取 `window._ROUTER_DATA = {...}` 的 JSON 字符串。"""
+    start_flag = "window._ROUTER_DATA = "
+    start_idx = text.find(start_flag)
+    if start_idx == -1:
+        return None
+    brace_start = text.find("{", start_idx)
+    if brace_start == -1:
+        return None
+    idx = brace_start
+    stack = []
+    while idx < len(text):
+        if text[idx] == "{":
+            stack.append("{")
+        elif text[idx] == "}":
+            stack.pop()
+            if not stack:
+                return text[brace_start:idx + 1]
+        idx += 1
     return None
 
 
-async def get_douyin_slide_info(url: str) -> Tuple[Optional[str], Optional[str], Optional[str], List[str]]:
-    """
-    获取抖音图集信息，尝试使用第三方API
-    :param url: 抖音短链
-    :return: (封面URL, 作者, 标题, 图片URL列表)
-    """
+# ── 网络请求 ──
+
+async def _get_redirect_url(url: str) -> Optional[str]:
+    """获取抖音短链接重定向后的真实 URL。"""
     try:
-        # 尝试使用第三方API解析
-        async with httpx.AsyncClient() as client:
-            resp = await client.get(f"https://api.xingzhige.com/API/douyin/?url={url}")
-            data = resp.json()
-
-        data_content = data.get("data", { })
-        item_id = data_content.get("jx", { }).get("item_id")
-        item_type = data_content.get("jx", { }).get("type")
-
-        if not item_id or not item_type:
-            logger.debug("第三方API未返回item_id或type")
-            return await _get_douyin_slide_info_fallback(url)
-
-        # 备用API成功解析图集，直接处理
-        if item_type == "图集":
-            item = data_content.get("item", { })
-            cover = item.get("cover", "")
-            images = item.get("images", [])
-            # 只有在有图片的情况下才发送
-            if images:
-                author = data_content.get("author", { }).get("name", "")
-                title = data_content.get("item", { }).get("title", "")
-                return cover, author, title, images
-
-        # 如果不是图集或解析失败，使用备用方法
-        return await _get_douyin_slide_info_fallback(url)
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                url, headers=DOUYIN_HEADERS, allow_redirects=True, timeout=aiohttp.ClientTimeout(total=15)
+            ) as resp:
+                return str(resp.url)
     except Exception as e:
-        logger.error(f"获取抖音图集信息失败: {e}")
-        return await _get_douyin_slide_info_fallback(url)
-
-
-async def _get_douyin_slide_info_fallback(url: str) -> Tuple[Optional[str], Optional[str], Optional[str], List[str]]:
-    """
-    获取抖音图集信息的备用方法
-    :param url: 抖音短链
-    :return: (封面URL, 作者, 标题, 图片URL列表)
-    """
-    try:
-        # 获取重定向后的URL
-        real_url = await get_redirect_url(url)
-        if not real_url:
-            return None, None, None, []
-
-        # 提取图集ID
-        slide_id_match = re.search(r"share\/slides\/(\d+)", real_url)
-        if not slide_id_match:
-            return None, None, None, []
-
-        slide_id = slide_id_match.group(1)
-        api_url = DOUYIN_VIDEO_API.format(slide_id)
-
-        async with httpx.AsyncClient(headers=DOUYIN_HEADER) as client:
-            resp = await client.get(api_url)
-            data = resp.json()
-
-        if not data.get('item_list'):
-            return None, None, None, []
-
-        item = data['item_list'][0]
-        author = item.get('author', { }).get('nickname', '未知作者')
-        title = item.get('desc', '无标题')
-        cover = item.get('video', { }).get('cover', { }).get('url_list', [None])[0]
-
-        images = []
-        for img in item.get('images', []):
-            if img.get('url_list'):
-                images.append(img['url_list'][0])
-
-        return cover, author, title, images
-    except Exception as e:
-        logger.error(f"获取抖音图集信息失败 (备用方法): {e}")
-        return None, None, None, []
-
-
-async def get_redirect_url(url: str) -> Optional[str]:
-    """
-    获取重定向后的URL，直接从headers获取location而不是follow redirects
-    :param url: 原始URL
-    :return: 重定向后的URL或None
-    """
-    try:
-        response = httpx.get(url, headers=DOUYIN_HEADER, follow_redirects=False)
-        if 'location' in response.headers:
-            return response.headers['location']
-        return str(response.url) if response.status_code == 200 else None
-    except Exception as e:
-        logger.error(f"获取重定向URL失败: {e}")
+        logger.error(f"获取重定向 URL 失败: {e}")
         return None
 
 
-async def download_image(url: str, session: Optional[aiohttp.ClientSession] = None) -> Optional[str]:
+async def _fetch_douyin_info(item_id: str, is_note: bool = False) -> Optional[dict]:
     """
-    下载图片到缓存目录
+    通过 iesdouyin.com 分享页面，无 Cookie 获取抖音视频/图集信息。
     
-    :param url: 图片URL
-    :param session: 可选的 aiohttp 会话
-    :return: 本地文件路径或None
+    返回 dict:
+        title       - 标题/描述
+        author      - 作者昵称
+        cover_url   - 封面图 URL（视频）
+        video_url   - 无水印视频地址（视频）
+        image_urls  - 图片 URL 列表（图集）
+        is_gallery  - 是否为图集
     """
+    if is_note:
+        url = f"https://www.iesdouyin.com/share/note/{item_id}/"
+    else:
+        url = f"https://www.iesdouyin.com/share/video/{item_id}/"
+
     try:
-        # 生成唯一文件名
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                url, headers=DOUYIN_HEADERS, timeout=aiohttp.ClientTimeout(total=15)
+            ) as resp:
+                if resp.status >= 400:
+                    logger.error(f"请求 iesdouyin 失败，状态码: {resp.status}")
+                    return None
+                html = await resp.text()
+
+        json_str = _extract_router_data(html)
+        if not json_str:
+            logger.error("未能从 HTML 中提取到 _ROUTER_DATA")
+            return None
+
+        # 处理转义的 Unicode 和正斜杠
+        json_str = json_str.replace("\\u002F", "/").replace("\\/", "/")
+        try:
+            data = json.loads(json_str)
+        except json.JSONDecodeError as e:
+            logger.error(f"_ROUTER_DATA JSON 解析失败: {e}")
+            return None
+
+        # 在 loaderData 中寻找内容数据
+        loader_data = data.get("loaderData", {})
+        item_info = None
+        for val in loader_data.values():
+            if not isinstance(val, dict):
+                continue
+            for key in ("videoInfoRes", "noteDetailRes"):
+                info = val.get(key)
+                if info and info.get("item_list"):
+                    item_info = info["item_list"][0]
+                    break
+            if item_info:
+                break
+
+        if not item_info:
+            logger.error("_ROUTER_DATA 中未找到 item_list 数据")
+            return None
+
+        # 基本信息
+        desc = item_info.get("desc", "无标题")
+        author_info = item_info.get("author", {})
+        nickname = author_info.get("nickname", "未知作者")
+
+        # 封面图
+        video_obj = item_info.get("video", {})
+        cover_url = (
+            video_obj.get("cover", {}).get("url_list", [None])[0]
+            if video_obj else None
+        )
+
+        # 图集图片
+        images = item_info.get("images") or []
+        image_urls = []
+        for img in images:
+            url_list = img.get("url_list", [])
+            if url_list:
+                # 优先用 url_list[1]（较大尺寸），回退 url_list[0]
+                image_urls.append(url_list[1] if len(url_list) > 1 else url_list[0])
+
+        # 视频地址
+        video_url = None
+        if not images:
+            play_addr = video_obj.get("play_addr", {})
+            uri = play_addr.get("uri")
+            if uri and isinstance(uri, str):
+                if uri.startswith("https://"):
+                    video_url = uri
+                else:
+                    video_url = f"https://www.douyin.com/aweme/v1/play/?video_id={uri}"
+
+        return {
+            "title": desc,
+            "author": nickname,
+            "cover_url": cover_url,
+            "video_url": video_url,
+            "image_urls": image_urls,
+            "is_gallery": bool(image_urls),
+        }
+
+    except Exception as e:
+        logger.error(f"获取抖音信息异常: {e}")
+        return None
+
+
+async def _try_fetch(item_id: str, prefer_note: bool = False) -> Optional[dict]:
+    """尝试获取信息，如果 prefer_note 模式失败则回退到另一种模式。"""
+    result = await _fetch_douyin_info(item_id, is_note=prefer_note)
+    if result:
+        return result
+    # 回退尝试另一种类型
+    return await _fetch_douyin_info(item_id, is_note=not prefer_note)
+
+
+# ── 下载图片（图集） ──
+
+async def _download_image(url: str, session: aiohttp.ClientSession) -> Optional[str]:
+    """下载图片到缓存目录并返回本地路径。"""
+    try:
         filename = f"img_{int(time.time())}_{random.randint(1000, 9999)}.jpg"
         filepath = os.path.join(CACHE_DIR, filename)
-        
-        if session:
-            async with session.get(url) as response:
-                if response.status != 200:
-                    logger.error(f"下载图片失败，状态码: {response.status}")
-                    return None
-                    
-                with open(filepath, 'wb') as fd:
-                    async for chunk in response.content.iter_chunked(1024):
-                        fd.write(chunk)
-        else:
-            async with aiohttp.ClientSession() as new_session:
-                async with new_session.get(url) as response:
-                    if response.status != 200:
-                        logger.error(f"下载图片失败，状态码: {response.status}")
-                        return None
-                        
-                    with open(filepath, 'wb') as fd:
-                        async for chunk in response.content.iter_chunked(1024):
-                            fd.write(chunk)
-                            
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+            if resp.status != 200:
+                return None
+            with open(filepath, "wb") as f:
+                async for chunk in resp.content.iter_chunked(1024):
+                    f.write(chunk)
         return filepath
     except Exception as e:
         logger.error(f"下载图片异常: {e}")
         return None
 
 
-async def process_douyin_url(event: AstrMessageEvent, douyin_ck: str = "", enable_forward: bool = True) -> AsyncGenerator:
+# ── 主入口 ──
+
+async def process_douyin_url(event: AstrMessageEvent) -> AsyncGenerator:
     """
-    处理抖音链接
-    :param event: AstrBot消息事件
-    :param douyin_ck: 抖音Cookie，用于获取无水印内容
-    :return: 生成器返回结果
+    处理抖音链接（无 Cookie 方式）。
+    
+    保留原始的消息回复格式：
+      - 视频：封面图 + "识别：抖音\\n作者：...\\n标题：..." → 视频
+      - 图集："识别：抖音\\n作者：...\\n标题：..." → 合并转发图片
     """
-    # 获取消息文本
     msg: str = event.message_str.strip()
     logger.info(f"处理抖音链接: {msg}")
 
-    # 匹配抖音短链接
-    reg = r"(http:|https:)\/\/v.douyin.com\/[A-Za-z\d._?%&+\-=#]*"
+    # 匹配短链接
+    reg = r"(http:|https:)\/\/v\.douyin\.com\/[A-Za-z\d._?%&+\-=#]*"
     douyin_match = re.search(reg, msg, re.I)
-
     if not douyin_match:
         yield event.plain_result("无法识别抖音链接")
         return
 
     douyin_url = douyin_match.group(0)
-    logger.debug(f"抖音短链接: {douyin_url}")
 
     try:
-        # 获取重定向后的URL (使用NoneBot中的直接获取location的方法)
-        dou_url_2 = await get_redirect_url(douyin_url)
-        if not dou_url_2:
+        # 解析短链接获取真实 URL
+        real_url = await _get_redirect_url(douyin_url)
+        if not real_url:
             yield event.plain_result("抖音短链接解析失败")
             return
 
-        logger.debug(f"重定向后的URL: {dou_url_2}")
+        logger.debug(f"重定向后的 URL: {real_url}")
 
-        # 处理图集 (如NoneBot示例中的方式)
-        if "share/slides" in dou_url_2:
-            cover, author, title, images = await get_douyin_slide_info(douyin_url)
+        # 判断是否为图集/笔记类型
+        is_note_url = bool(re.search(r"/(note|slides)/", real_url))
 
-            if author is not None and images:
-                # 尝试从页面获取封面（media_parser 方式）
-                slide_id_match = re.search(r"share\/slides\/(\d+)", dou_url_2)
-                if slide_id_match:
-                    page_cover = await fetch_douyin_cover_from_page(slide_id_match.group(1))
-                    if page_cover:
-                        cover = page_cover
+        # 提取视频/笔记 ID
+        id_match = re.search(r"/(?:video|note|slides)/(\d+)", real_url)
+        if not id_match:
+            yield event.plain_result("无法提取抖音视频/笔记 ID")
+            return
 
-                # 创建消息内容列表
+        item_id = id_match.group(1)
+        info = await _try_fetch(item_id, prefer_note=is_note_url)
+        if not info:
+            yield event.plain_result("抖音解析失败，无法获取内容详情")
+            return
+
+        author = info["author"]
+        title = info["title"]
+        cover_url = info["cover_url"]
+        video_url = info["video_url"]
+        image_urls = info["image_urls"]
+
+        if info["is_gallery"]:
+            # ── 图集（同原始回复格式） ──
+            yield event.chain_result([
+                Comp.Plain(f"识别：抖音\n作者：{author}\n标题：{title}")
+            ])
+
+            if image_urls:
                 content_list = []
-
-                # 第一条：封面图 + 简介文字（只发一次，合并/逐条都用这一条）
-                intro_comps = []
-                if cover:
-                    intro_comps.append(Comp.Image.fromURL(cover))
-                intro_comps.append(Comp.Plain(f"识别：抖音\n作者：{author}\n标题：{title}\n图集共 {len(images)} 张图片"))
-                content_list.append(intro_comps)
+                content_list.append([
+                    Comp.Plain(f"抖音 | {title}\n作者: {author}\n\n图集共 {len(image_urls)} 张图片")
+                ])
 
                 # 下载图片
-                downloaded_images = []
+                downloaded = []
                 try:
                     async with aiohttp.ClientSession() as session:
-                        download_tasks = [
-                            download_image(image_url, session)
-                            for image_url in images
-                            if image_url is not None
-                        ]
-                        if download_tasks:
-                            downloaded_images = await asyncio.gather(*download_tasks)
+                        tasks = []
+                        for img_url in image_urls:
+                            if img_url:
+                                tasks.append(_download_image(img_url, session))
+                        if tasks:
+                            downloaded = await asyncio.gather(*tasks)
                 except Exception as e:
-                    logger.error(f"下载图片失败: {e}")
+                    logger.error(f"下载图集图片失败: {e}")
 
-                # 添加每张图片到转发消息
-                for i, image_path in enumerate(downloaded_images):
-                    if image_path is not None:
+                for i, path in enumerate(downloaded):
+                    if path:
                         content_list.append([
-                            Comp.Image.fromFileSystem(image_path),
-                            Comp.Plain(f"\n第 {i+1}/{len(downloaded_images)} 张")
+                            Comp.Image.fromFileSystem(path),
+                            Comp.Plain(f"\n第 {i+1}/{len(downloaded)} 张"),
                         ])
 
-                # 发送
                 if content_list:
-                    if enable_forward:
-                        try:
-                            yield await send_forward_message(event, content_list)
-                        except Exception as e:
-                            logger.error(f"发送合并转发消息失败: {e}")
-                            yield event.plain_result("合并转发失败，单独发送图片...")
-                            for result in [event.chain_result(content_list[0])]:
-                                yield result
-                            for i, image_path in enumerate(downloaded_images):
-                                if image_path is not None:
-                                    try:
-                                        yield event.chain_result([
-                                            Comp.Image.fromFileSystem(image_path),
-                                            Comp.Plain(f"\n第 {i+1}/{len(downloaded_images)} 张")
-                                        ])
-                                    except Exception as e2:
-                                        logger.error(f"发送单张图片失败: {e2}")
-                    else:
-                        async for result in send_images_sequentially(event, content_list, None):
-                            yield result
+                    try:
+                        yield await send_forward_message(event, content_list)
+                    except Exception as e:
+                        logger.error(f"发送合并转发消息失败: {e}")
+                        yield event.plain_result("合并转发失败，单独发送图片...")
+                        for i, path in enumerate(downloaded):
+                            if path:
+                                try:
+                                    yield event.chain_result([
+                                        Comp.Image.fromFileSystem(path),
+                                        Comp.Plain(f"\n第 {i+1}/{len(downloaded)} 张"),
+                                    ])
+                                except Exception as e2:
+                                    logger.error(f"发送单张图片失败: {e2}")
 
                 # 清理临时文件
-                for path in downloaded_images:
+                for path in downloaded:
                     if path and os.path.exists(path):
                         try:
                             os.remove(path)
                         except Exception as e:
                             logger.error(f"删除临时文件失败: {e}")
             else:
-                yield event.plain_result("抖音图集解析失败")
-            return
-
-        # 提取视频/笔记ID (如NoneBot示例)
-        reg2 = r".*(video|note)\/(\d+)\/?.*?"
-        id_match = re.search(reg2, dou_url_2, re.I)
-
-        if not id_match:
-            yield event.plain_result("无法提取抖音视频/笔记ID")
-            return
-
-        douyin_id = id_match.group(2)
-        logger.debug(f"抖音ID: {douyin_id}")
-
-        # 检查是否有Cookie
-        if not douyin_ck:
-            yield event.plain_result("未设置抖音Cookie，无法获取无水印内容")
-            return
-
-        # 准备请求头 (类似NoneBot示例)
-        headers = {
-            'Accept-Language': 'zh-CN,zh;q=0.8,zh-TW;q=0.7,zh-HK;q=0.5,en-US;q=0.3,en;q=0.2',
-            'referer': f'https://www.douyin.com/video/{douyin_id}',
-            'cookie': douyin_ck,
-            'User-Agent': DOUYIN_HEADER['User-Agent']
-        }
-
-        # 使用A-Bogus签名生成API URL (如NoneBot示例)
-        api_url = DOUYIN_VIDEO_API.format(douyin_id)
-        api_url = generate_x_bogus_url(api_url, headers)
-
-        # 请求API
-        async with httpx.AsyncClient() as client:
-            resp = await client.get(api_url, headers=headers, timeout=10)
-            data = resp.json()
-
-            if not data or 'aweme_detail' not in data:
-                yield event.plain_result("抖音解析失败，无法获取内容详情")
+                yield event.plain_result("无法获取图集图片")
+        else:
+            # ── 视频（同原始回复格式） ──
+            if not video_url:
+                yield event.plain_result("无法获取视频播放地址")
                 return
 
-            detail = data['aweme_detail']
-            desc = detail.get('desc', '无标题')
-            author = detail.get('author', { }).get('nickname', '未知作者')
+            if cover_url:
+                yield event.chain_result([
+                    Comp.Image.fromURL(cover_url),
+                    Comp.Plain(f"识别：抖音\n作者：{author}\n标题：{title}"),
+                ])
+            else:
+                yield event.chain_result([
+                    Comp.Plain(f"识别：抖音\n作者：{author}\n标题：{title}"),
+                ])
 
-            # 判断内容类型 (类似NoneBot示例)
-            url_type_code = detail.get('aweme_type', 0)
-            url_type = URL_TYPE_CODE_DICT.get(url_type_code, 'video')
-
-            if url_type == 'video':
-                # 处理视频 (类似NoneBot示例)
-                video_info = detail.get('video', { })
-                play_addr = video_info.get('play_addr', { })
-                uri = play_addr.get('uri')
-
-                if not uri:
-                    yield event.plain_result("无法获取视频播放地址")
-                    return
-
-                # 获取无水印视频地址
-                player_real_addr = DOUYIN_TOUTIAO_API.format(uri)
-
-                # 封面：优先从页面解析获取（media_parser 方式），回退到 API 返回的 cover
-                is_note = "/note/" in dou_url_2
-                cover_url = await fetch_douyin_cover_from_page(douyin_id, is_note=is_note)
-                if not cover_url:
-                    cover_url = video_info.get('cover', { }).get('url_list', [None])[0]
-
-                if cover_url is not None:
-                    yield event.chain_result([
-                        Comp.Image.fromURL(cover_url),
-                        Comp.Plain(f"识别：抖音\n作者：{author}\n标题：{desc}")
-                    ])
-
-                # 直接通过URL发送视频，不需要下载
-                yield event.chain_result([Comp.Video.fromURL(player_real_addr)])
-
-            elif url_type == 'image':
-                # 处理图片集
-                images = detail.get('images', [])
-
-                if not images:
-                    yield event.plain_result("无法获取图片内容")
-                    return
-
-                # 封面：优先从页面解析获取（media_parser 方式），回退到第一张图片
-                is_note = "/note/" in dou_url_2
-                cover_url = await fetch_douyin_cover_from_page(douyin_id, is_note=is_note)
-
-                # 创建消息内容列表
-                content_list = []
-
-                # 第一条：封面（若有）+ 简介文字（只发一次，合并/逐条都用这一条）
-                intro_comps = []
-                if cover_url:
-                    intro_comps.append(Comp.Image.fromURL(cover_url))
-                intro_comps.append(Comp.Plain(f"识别：抖音\n作者：{author}\n标题：{desc}\n图集共 {len(images)} 张图片"))
-                content_list.append(intro_comps)
-
-                # 添加每张图片
-                for i, img in enumerate(images):
-                    url_list = img.get('url_list', [])
-                    img_url = url_list[1] if len(url_list) > 1 and url_list[1] else (url_list[0] if url_list else None)
-                    if img_url is not None:
-                        content_list.append([
-                            Comp.Image.fromURL(img_url),
-                            Comp.Plain(f"\n第 {i+1}/{len(images)} 张")
-                        ])
-
-                # 发送合并转发消息
-                if content_list:
-                    if enable_forward:
-                        yield await send_forward_message(event, content_list)
-                    else:
-                        async for result in send_images_sequentially(event, content_list, None):
-                            yield result
+            yield event.chain_result([Comp.Video.fromURL(video_url)])
 
     except Exception as e:
         logger.error(f"处理抖音链接失败: {e}")

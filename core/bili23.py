@@ -317,8 +317,8 @@ async def process_bilibili_url(event: AstrMessageEvent, credential: Credential, 
     streams = detecter.detect_best_streams()
     video_url, audio_url = streams[0].url, streams[1].url
     # 下载视频和音频
-    download_path = os.getcwd() + "/data/bilibili_cache/" + video_id
-    os.makedirs(download_path, exist_ok=True)
+    download_path = os.path.join(os.getcwd(), "data", "plugin_data", "astrbot_plugin_rconsole", "bilibili_cache", video_id)
+    os.makedirs(os.path.dirname(download_path), exist_ok=True)
     try:
         await asyncio.gather(
             download_b_file(video_url, f"{download_path}-video.m4s", logger.debug),

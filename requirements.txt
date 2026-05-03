@@ -1,0 +1,3 @@
+astrbot>=3.5.13
+bilibili-api-python>=17.2.1
+pyexecjs>=1.5.1
